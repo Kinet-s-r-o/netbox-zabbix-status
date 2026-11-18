@@ -23,6 +23,7 @@ from netbox.context import current_request
 from .choices import AvailabilityChoices, MatchMethodChoices, ZabbixHostStatusChoices
 from .matching import HostMatcher, match_unmatched_host, normalize_hostname
 from .models import ZabbixHost, ZabbixProblem
+from . import zabbix_adapter as adapter
 from .zabbix import get_client, get_setting
 
 logger = logging.getLogger('netbox.plugins.netbox_zabbix_status')
@@ -62,58 +63,16 @@ INTERFACE_TYPE_FIELDS = {
 }
 
 
-def fetch_hosts(api):
-    return api.host.get(
-        output=['hostid', 'host', 'name', 'status', 'maintenance_status',
-                'active_available', 'proxyid', 'proxy_groupid', 'monitored_by'],
-        selectInterfaces=['type', 'ip', 'dns', 'port', 'useip', 'available'],
-        selectParentTemplates=['name'],
-        selectHostGroups=['name'],
-        selectTags='extend',
-    )
+_warned_versions = set()
 
 
-def fetch_problems(api, min_severity, include_suppressed):
-    """Vráti (problems, trigger_hosts). problem.objectid je triggerid,
-    mapovanie na hostov ide cez trigger.get."""
-    params = dict(
-        output=['eventid', 'objectid', 'name', 'severity', 'acknowledged',
-                'suppressed', 'clock', 'opdata'],
-        selectTags='extend',
-        severities=list(range(min_severity, 6)),
-        recent=False,
-        sortfield='eventid',
-    )
-    if not include_suppressed:
-        # Parita so Zabbix UI: problémy hostov v maintenance sa defaultne skrývajú
-        params['suppressed'] = False
-    problems = api.problem.get(**params)
-    trigger_hosts = {}
-    trigger_ids = list({p['objectid'] for p in problems})
-    if trigger_ids:
-        triggers = api.trigger.get(
-            triggerids=trigger_ids,
-            output=['triggerid'],
-            selectHosts=['hostid'],
-        )
-        trigger_hosts = {
-            t['triggerid']: [h['hostid'] for h in t.get('hosts', [])]
-            for t in triggers
-        }
-    return problems, trigger_hosts
-
-
-def fetch_proxy_names(api):
-    names = {}
-    for proxy in api.proxy.get(output=['proxyid', 'name']):
-        names[('proxy', proxy['proxyid'])] = proxy['name']
-    try:
-        for group in api.proxygroup.get(output=['proxy_groupid', 'name']):
-            names[('group', group['proxy_groupid'])] = f"{group['name']} (proxy group)"
-    except Exception:
-        # proxy groups existujú až od Zabbix 7.0
-        pass
-    return names
+def _warn_once_if_untested(version):
+    """Sync beží každých pár minút — upozornenie na netestovanú verziu
+    Zabbixu stačí zalogovať raz za život procesu."""
+    level, message = adapter.version_status(version)
+    if level != 'ok' and version not in _warned_versions:
+        _warned_versions.add(version)
+        logger.warning(message)
 
 
 def resolve_proxy_name(zabbix_host, proxy_names):
@@ -193,13 +152,17 @@ def run_sync():
     started = time.monotonic()
     api = get_client()
 
-    zabbix_hosts = fetch_hosts(api)
-    problems, trigger_hosts = fetch_problems(
+    version = adapter.detect_version(api)
+    _warn_once_if_untested(version)
+
+    zabbix_hosts = adapter.fetch_hosts(api, version)
+    problems = adapter.fetch_problems(
         api,
         int(get_setting('min_severity', 2)),
         bool(get_setting('include_suppressed', False)),
     )
-    proxy_names = fetch_proxy_names(api)
+    trigger_hosts = adapter.fetch_trigger_hosts(api, problems)
+    proxy_names = adapter.fetch_proxy_names(api, version)
 
     # matching_enabled=False -> čistý Zabbix viewer: väzby sa nevytvárajú ani
     # nemenia (existujúce zostávajú v DB nedotknuté, prepnutie späť je bezstratové)

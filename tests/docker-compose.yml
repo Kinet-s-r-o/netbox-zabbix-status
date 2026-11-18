@@ -1,0 +1,33 @@
+# Zabbix (PostgreSQL) pre integračný test adaptéra. Verzia sa vyberá premennou:
+#   ZABBIX_VERSION=8.0 docker compose -f tests/docker-compose.yml up -d
+#   python tests/integration_check.py        # API na http://localhost:8080
+# Predvolené prihlásenie: Admin / zabbix.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix
+      POSTGRES_DB: zabbix
+
+  server:
+    image: zabbix/zabbix-server-pgsql:alpine-${ZABBIX_VERSION:?set ZABBIX_VERSION, e.g. 8.0}-latest
+    depends_on: [db]
+    environment:
+      DB_SERVER_HOST: db
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix
+      POSTGRES_DB: zabbix
+
+  web:
+    image: zabbix/zabbix-web-nginx-pgsql:alpine-${ZABBIX_VERSION}-latest
+    depends_on: [db, server]
+    ports:
+      - "8080:8080"
+    environment:
+      ZBX_SERVER_HOST: server
+      DB_SERVER_HOST: db
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix
+      POSTGRES_DB: zabbix
+      PHP_TZ: UTC

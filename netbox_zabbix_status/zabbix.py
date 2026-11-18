@@ -8,6 +8,8 @@ from django.core.cache import cache
 
 from zabbix_utils import ZabbixAPI
 
+from . import zabbix_adapter as adapter
+
 PLUGIN_NAME = 'netbox_zabbix_status'
 HISTORY_LIMIT = 500
 
@@ -65,21 +67,12 @@ def get_live_problems(hostid: int) -> list:
     if cached is not None:
         return cached
 
-    api = get_client()
-    params = dict(
+    problems = adapter.fetch_problems(
+        get_client(),
+        int(get_setting('min_severity', 2)),
+        bool(get_setting('include_suppressed', False)),
         hostids=[hostid],
-        # objectid = triggerid (source=trigger je jediný typ problémov, ktoré
-        # sledujeme) — potrebné na priamy odkaz na problém v Zabbixe (tr_events.php)
-        output=['eventid', 'objectid', 'name', 'severity', 'acknowledged',
-                'suppressed', 'clock', 'opdata'],
-        selectTags='extend',
-        severities=list(range(int(get_setting('min_severity', 2)), 6)),
-        recent=False,
-        sortfield='eventid',
     )
-    if not get_setting('include_suppressed', False):
-        params['suppressed'] = False
-    problems = api.problem.get(**params)
     cache.set(cache_key, problems, int(get_setting('cache_ttl', 30)))
     return problems
 
@@ -96,14 +89,7 @@ def get_host_inventory(hostid: int) -> dict:
     if cached is not None:
         return cached
 
-    api = get_client()
-    hosts = api.host.get(
-        hostids=[hostid],
-        output=[],
-        selectInventory=['location_lat', 'location_lon'],
-    )
-    # Zabbix vráti 'inventory': [] (nie {}) keď má host vypnuté inventory
-    inventory = (hosts[0].get('inventory') or {}) if hosts else {}
+    inventory = adapter.fetch_host_inventory(get_client(), hostid)
     cache.set(cache_key, inventory, int(get_setting('cache_ttl', 30)))
     return inventory
 
@@ -124,9 +110,7 @@ def get_host_tags(hostid: int) -> list:
     if cached is not None:
         return cached
 
-    api = get_client()
-    hosts = api.host.get(hostids=[hostid], output=[], selectTags='extend')
-    tags = (hosts[0].get('tags') or []) if hosts else []
+    tags = adapter.fetch_host_tags(get_client(), hostid) or []
     cache.set(cache_key, tags, int(get_setting('cache_ttl', 30)))
     return tags
 
@@ -150,20 +134,20 @@ def update_host_tags(hostid: int, tag_values: dict) -> None:
     vychádzať z čerstvého stavu, inak by mohol prepísať medzičasom pridaný
     tag hodnotou zo starej cache."""
     api = get_client()
-    hosts = api.host.get(hostids=[hostid], output=[], selectTags='extend')
-    if not hosts:
+    current_tags = adapter.fetch_host_tags(api, hostid)
+    if current_tags is None:
         return
 
     # Zabbix vráti aj 'automatic' pole (LLD/host prototyp pôvod tagu) —
     # host.update ho ako vstupný parameter neakceptuje, treba ho zahodiť
-    current = {t['tag']: t['value'] for t in hosts[0].get('tags') or []}
+    current = {t['tag']: t['value'] for t in current_tags}
     for key, value in tag_values.items():
         if value is None:
             continue
         current[key] = str(value)
 
     new_tags = [{'tag': k, 'value': v} for k, v in current.items()]
-    api.host.update(hostid=hostid, tags=new_tags)
+    adapter.set_host_tags(api, hostid, new_tags)
     cache.delete(_host_tags_cache_key(hostid))
 
 
@@ -174,16 +158,16 @@ def remove_host_tags(hostid: int, tag_keys) -> None:
     nesúvisiace) ostávajú nedotknuté. Volá sa z tlačidla „Odstrániť Zabbix
     tagy" na detaile Zabbix hosta (views.ZabbixHostRemoveTagsView)."""
     api = get_client()
-    hosts = api.host.get(hostids=[hostid], output=[], selectTags='extend')
-    if not hosts:
+    current_tags = adapter.fetch_host_tags(api, hostid)
+    if current_tags is None:
         return
 
     remaining = [
         {'tag': t['tag'], 'value': t['value']}
-        for t in (hosts[0].get('tags') or [])
+        for t in current_tags
         if t['tag'] not in tag_keys
     ]
-    api.host.update(hostid=hostid, tags=remaining)
+    adapter.set_host_tags(api, hostid, remaining)
     cache.delete(_host_tags_cache_key(hostid))
 
 
@@ -206,33 +190,13 @@ def get_problem_history(hostid: int, time_from: int, time_till: int) -> list:
     if cached is not None:
         return cached
 
-    api = get_client()
-    events = api.event.get(
-        hostids=[hostid],
-        source=0,  # EVENT_SOURCE_TRIGGERS
-        object=0,  # EVENT_OBJECT_TRIGGER
-        value=1,   # riadky vzniku problému
-        time_from=time_from,
-        time_till=time_till,
-        # objectid = triggerid, potrebné na priamy odkaz na problém (tr_events.php)
-        output=['eventid', 'objectid', 'name', 'severity', 'clock', 'r_eventid',
-                'acknowledged'],
-        selectTags='extend',
-        severities=list(range(int(get_setting('min_severity', 2)), 6)),
-        sortfield=['clock'],
-        sortorder='DESC',
-        limit=HISTORY_LIMIT,
+    events = adapter.fetch_problem_history(
+        get_client(),
+        hostid,
+        int(get_setting('min_severity', 2)),
+        time_from,
+        time_till,
+        HISTORY_LIMIT,
     )
-
-    resolution_ids = sorted({
-        e['r_eventid'] for e in events if e.get('r_eventid') not in (None, '0')
-    })
-    resolution_clocks = {}
-    if resolution_ids:
-        resolutions = api.event.get(eventids=resolution_ids, output=['eventid', 'clock'])
-        resolution_clocks = {r['eventid']: r['clock'] for r in resolutions}
-    for e in events:
-        e['r_clock'] = resolution_clocks.get(e.get('r_eventid'), '0')
-
     cache.set(cache_key, events, int(get_setting('cache_ttl', 30)))
     return events

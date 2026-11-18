@@ -16,7 +16,8 @@ Design and full scope: see `ZABBIX-PLUGIN-SPEC.md` in the netbox-docker repo.
 |---|---|
 | NetBox | 4.6 or newer |
 | Python | 3.10 or newer |
-| zabbix_utils | ≥ 2.0 |
+| Zabbix server | 6.0, 7.0, 7.4, 8.0 (tested in CI); other versions are likely to work — `manage.py zabbix_check` and the sync log warn about untested ones |
+| zabbix_utils | ≥ 2.0.5 (first release with Zabbix 8.0 support) |
 | Redis + RQ worker | Standard NetBox requirement (`netbox-worker`/`netbox-rq` service) |
 
 > **Important:** the RQ worker must be running — neither the periodic sync
@@ -229,9 +230,46 @@ recipe. The repo is bind-mounted into the containers via
 changes take effect after a container restart, without an image rebuild. A
 rebuild is only needed when dependencies change (`pyproject.toml`).
 
+### Zabbix version compatibility
+
+All Zabbix API queries live in one module,
+`netbox_zabbix_status/zabbix_adapter.py`. Everything that differs between
+Zabbix versions (field names, methods that exist only in newer releases) is
+handled there, and responses are normalized to a single shape — the rest of the
+plugin never checks the Zabbix version.
+
+```bash
+# Unit tests (fake API, no Docker, no NetBox needed)
+python -m unittest discover -s tests -v
+
+# Integration check against a real Zabbix of a given version (needs Docker)
+ZABBIX_VERSION=8.0 docker compose -p nbzs80 -f tests/docker-compose.yml up -d
+EXPECT_VERSION=8.0 python tests/integration_check.py
+ZABBIX_VERSION=8.0 docker compose -p nbzs80 -f tests/docker-compose.yml down -v
+```
+
+CI (`.github/workflows/ci.yml`) runs the integration check for every version in
+`TESTED_VERSIONS` on each push and weekly, so a new Zabbix release that breaks
+an API call is caught without a code change being the trigger.
+
+**When a new Zabbix major version comes out:**
+1. Skim the "Changes from X to Y" page of the Zabbix API documentation and
+   compare it with the methods used in `zabbix_adapter.py`.
+2. Adjust the adapter only if something changed there.
+3. Add the version to `TESTED_VERSIONS` and to the matrix in `ci.yml` (a unit
+   test fails if the two lists drift apart).
+
 ## Changelog
 
 ### Unreleased
+- **Zabbix version compatibility layer** — all Zabbix API queries moved into
+  `zabbix_adapter.py` with version detection and normalized responses
+  (handles Zabbix 6.0 field names such as `proxy_hostid`/`selectGroups`, and
+  proxy groups from 7.0). `manage.py zabbix_check` now reports whether the
+  Zabbix version is tested, and the sync logs a one-time warning for untested
+  versions. Zabbix 8.0 verified. New unit tests and a CI matrix running the
+  adapter against real Zabbix 6.0 / 7.0 / 7.4 / 8.0. `zabbix_utils` minimum
+  raised to 2.0.5 (Zabbix 8.0 support).
 - **Plugin UI fully translated to English** — every user-facing string
   (form labels and help text, flash messages, table column headers, menu
   items, dashboard widget, management command output, and all templates)
